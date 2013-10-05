@@ -104,33 +104,37 @@ static int page_zero_filled(void *ptr)
 	return 1;
 }
 
-static void zram_set_disksize(struct zram *zram, size_t totalram_bytes)
+static void zram_set_disksize(struct zram *zram)
 {
+	u64 totalram_bytes = ((u64) totalram_pages) << PAGE_SHIFT;
+
 	if (!zram->disksize) {
+		u64 bytes = totalram_bytes;
 		pr_info(
 		"disk size not provided. You can use disksize_kb module "
 		"param to specify size.\nUsing default: (%u%% of RAM).\n",
 		default_disksize_perc_ram
 		);
-		zram->disksize = default_disksize_perc_ram *
-					(totalram_bytes / 100);
+		do_div(bytes, 100);
+		zram->disksize = default_disksize_perc_ram * bytes;
 	}
 
-	if (zram->disksize > 2 * (totalram_bytes)) {
+	if (zram->disksize > 2 * totalram_bytes) {
 		pr_info(
 		"There is little point creating a zram of greater than "
 		"twice the size of memory since we expect a 2:1 compression "
 		"ratio. Note that zram uses about 0.1%% of the size of "
 		"the disk when not in use so a huge zram is "
 		"wasteful.\n"
-		"\tMemory Size: %zu kB\n"
+		"\tMemory Size: %llu kB\n"
 		"\tSize you selected: %llu kB\n"
 		"Continuing anyway ...\n",
-		totalram_bytes >> 10, zram->disksize
+		totalram_bytes >> 10, zram->disksize >> 10
 		);
 	}
 
-	zram->disksize &= PAGE_MASK;
+	/* can't use PAGE_MASK because it does not extend correctly to 64 bit */
+	zram->disksize &= ~((1ULL << PAGE_SHIFT) - 1);
 }
 
 static void zram_free_page(struct zram *zram, size_t index)
@@ -156,7 +160,7 @@ static void zram_free_page(struct zram *zram, size_t index)
 		goto out;
 	}
 
-	zs_free(zram->mem_pool, handle);
+	zs_free(zram->mem_pool, (unsigned long)handle);
 
 	if (zram->table[index].size <= PAGE_SIZE / 2)
 		zram_stat_dec(&zram->stats.good_compress);
@@ -247,7 +251,7 @@ static int zram_bvec_read(struct zram *zram, struct bio_vec *bvec,
 		uncmem = user_mem;
 	clen = PAGE_SIZE;
 
-	cmem = zs_map_object(zram->mem_pool, zram->table[index].handle);
+	cmem = zs_map_object(zram->mem_pool, (unsigned long)zram->table[index].handle, ZS_MM_RW);
 
 	ret = lzo1x_decompress_safe(cmem + sizeof(*zheader),
 				    zram->table[index].size,
@@ -259,7 +263,7 @@ static int zram_bvec_read(struct zram *zram, struct bio_vec *bvec,
 		kfree(uncmem);
 	}
 
-	zs_unmap_object(zram->mem_pool, zram->table[index].handle);
+	zs_unmap_object(zram->mem_pool, (unsigned long)zram->table[index].handle);
 	kunmap_atomic(user_mem);
 
 	/* Should NEVER happen. Return bio error if it does. */
@@ -287,7 +291,7 @@ static int zram_read_before_write(struct zram *zram, char *mem, u32 index)
 		return 0;
 	}
 
-	cmem = zs_map_object(zram->mem_pool, zram->table[index].handle);
+	cmem = zs_map_object(zram->mem_pool, (unsigned long)zram->table[index].handle, ZS_MM_RO);
 
 	/* Page is stored uncompressed since it's incompressible */
 	if (unlikely(zram_test_flag(zram, index, ZRAM_UNCOMPRESSED))) {
@@ -299,7 +303,7 @@ static int zram_read_before_write(struct zram *zram, char *mem, u32 index)
 	ret = lzo1x_decompress_safe(cmem + sizeof(*zheader),
 				    zram->table[index].size,
 				    mem, &clen);
-	zs_unmap_object(zram->mem_pool, zram->table[index].handle);
+	zs_unmap_object(zram->mem_pool, (unsigned long)zram->table[index].handle);
 
 	/* Should NEVER happen. Return bio error if it does. */
 	if (unlikely(ret != LZO_E_OK)) {
@@ -405,14 +409,14 @@ static int zram_bvec_write(struct zram *zram, struct bio_vec *bvec, u32 index,
 		goto memstore;
 	}
 
-	handle = zs_malloc(zram->mem_pool, clen + sizeof(*zheader));
+	handle = (void *)zs_malloc(zram->mem_pool, clen + sizeof(*zheader));
 	if (!handle) {
 		pr_info("Error allocating memory for compressed "
 			"page: %u, size=%zu\n", index, clen);
 		ret = -ENOMEM;
 		goto out;
 	}
-	cmem = zs_map_object(zram->mem_pool, handle);
+	cmem = zs_map_object(zram->mem_pool, (unsigned long)handle, ZS_MM_WO);
 
 memstore:
 #if 0
@@ -430,7 +434,7 @@ memstore:
 		kunmap_atomic(cmem);
 		kunmap_atomic(src);
 	} else {
-		zs_unmap_object(zram->mem_pool, handle);
+		zs_unmap_object(zram->mem_pool, (unsigned long)handle);
 	}
 
 	zram->table[index].handle = handle;
@@ -599,7 +603,7 @@ void __zram_reset_device(struct zram *zram)
 		if (unlikely(zram_test_flag(zram, index, ZRAM_UNCOMPRESSED)))
 			__free_page(handle);
 		else
-			zs_free(zram->mem_pool, handle);
+			zs_free(zram->mem_pool, (unsigned long)handle);
 	}
 
 	vfree(zram->table);
@@ -633,7 +637,7 @@ int zram_init_device(struct zram *zram)
 		return 0;
 	}
 
-	zram_set_disksize(zram, totalram_pages << PAGE_SHIFT);
+	zram_set_disksize(zram);
 
 	zram->compress_workmem = kzalloc(LZO1X_MEM_COMPRESS, GFP_KERNEL);
 	if (!zram->compress_workmem) {

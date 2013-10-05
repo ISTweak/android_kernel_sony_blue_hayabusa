@@ -35,6 +35,13 @@
 #define CREATE_TRACE_POINTS
 #include <trace/events/cpufreq_interactive.h>
 
+#ifdef MODULE
+#include <linux/kallsyms.h>
+static int (*gm_sched_setscheduler_nocheck)(struct task_struct *, int,
+                              const struct sched_param *);
+#define sched_setscheduler_nocheck (*gm_sched_setscheduler_nocheck)
+#endif
+
 static atomic_t active_count = ATOMIC_INIT(0);
 
 struct cpufreq_interactive_cpuinfo {
@@ -948,6 +955,11 @@ static int __init cpufreq_interactive_init(void)
 	above_hispeed_delay_val = DEFAULT_ABOVE_HISPEED_DELAY;
 	timer_rate = DEFAULT_TIMER_RATE;
 
+#ifdef MODULE
+	gm_sched_setscheduler_nocheck = (int (*)(struct task_struct *, int,
+		const struct sched_param *))kallsyms_lookup_name("sched_setscheduler_nocheck");
+#endif
+
 	/* Initalize per-cpu timers */
 	for_each_possible_cpu(i) {
 		pcpu = &per_cpu(cpuinfo, i);
@@ -995,7 +1007,12 @@ module_init(cpufreq_interactive_init);
 
 static void __exit cpufreq_interactive_exit(void)
 {
+#ifdef MODULE
+	gm_sched_setscheduler_nocheck = (int (*)(struct task_struct *, int,
+		const struct sched_param *))kallsyms_lookup_name("sched_setscheduler_nocheck");
+#endif
 	cpufreq_unregister_governor(&cpufreq_gov_interactive);
+	idle_notifier_unregister(&cpufreq_interactive_idle_nb);
 	kthread_stop(up_task);
 	put_task_struct(up_task);
 	destroy_workqueue(down_wq);
